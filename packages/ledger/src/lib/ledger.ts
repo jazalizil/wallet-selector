@@ -1,29 +1,37 @@
 import { isMobile } from "is-mobile";
 import { signTransactions } from "@near-wallet-selector/wallet-utils";
 import type {
-  WalletModuleFactory,
-  WalletBehaviourFactory,
-  JsonStorageService,
   Account,
   HardwareWallet,
-  Transaction,
+  JsonStorageService,
   Optional,
-  SignMessageParams,
   SignedMessage,
+  SignMessageParams,
+  Transaction as WalletTransaction,
+  WalletBehaviourFactory,
+  WalletBehaviourOptions,
+  WalletModuleFactory,
 } from "@near-wallet-selector/core";
 import {
   getActiveAccount,
   verifyFullKeyBelongsToUser,
   verifySignature,
 } from "@near-wallet-selector/core";
+import { PublicKey } from "@near-js/crypto";
+import { KeyType } from "@near-js/crypto";
+import type {
+  DelegateAction,
+  Transaction as NearTransaction,
+} from "@near-js/transactions";
+import { SignedDelegate, SignedTransaction } from "@near-js/transactions";
 
-import { isLedgerSupported, LedgerClient } from "./ledger-client";
 import type { Subscription } from "./ledger-client";
-import type { Signer } from "near-api-js";
+import { LedgerClient } from "./ledger-client";
 import * as nearAPI from "near-api-js";
+import { Signer } from "near-api-js";
 import type { FinalExecutionOutcome } from "near-api-js/lib/providers/index.js";
 import icon from "./icon";
-import { serializeLedgerNEP413Payload } from "./nep413/ledger-payload";
+import { webHidIdentifier } from "@ledgerhq/device-transport-kit-web-hid";
 
 interface LedgerAccount extends Account {
   derivationPath: string;
@@ -44,25 +52,141 @@ interface LedgerState {
 export interface LedgerParams {
   iconUrl?: string;
   deprecated?: boolean;
+  transport?: string;
 }
 
 export const STORAGE_ACCOUNTS = "accounts";
 
 const setupLedgerState = async (
-  storage: JsonStorageService
+  storage: JsonStorageService,
+  logger: WalletBehaviourOptions<HardwareWallet>["logger"]
 ): Promise<LedgerState> => {
   const accounts = await storage.getItem<Array<LedgerAccount>>(
     STORAGE_ACCOUNTS
   );
 
   return {
-    client: new LedgerClient(),
+    client: new LedgerClient(logger),
     subscriptions: [],
     accounts: accounts || [],
   };
 };
 
-const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
+type LedgerHardwareWallet = HardwareWallet & {
+  metadata: HardwareWallet["metadata"] & {
+    transport: string;
+  };
+};
+
+class LedgerSigner extends Signer {
+  constructor(
+    private ledgerState: LedgerState,
+    private store: WalletBehaviourOptions<HardwareWallet>["store"]
+  ) {
+    super();
+  }
+  createKey(): Promise<PublicKey> {
+    throw new Error("Method not implemented.");
+  }
+  private _getDerivationPath() {
+    const activeAccount = this.store
+      .getState()
+      .accounts.find((ac) => ac.active);
+    if (!activeAccount) {
+      throw new Error("Failed to find derivation path for active account");
+    }
+    const ledgerAccount = this.ledgerState.accounts.find(
+      (ac) => ac.accountId === activeAccount.accountId
+    );
+    if (!ledgerAccount) {
+      throw new Error("Failed to find derivation path for active account");
+    }
+    return ledgerAccount.derivationPath;
+  }
+  signMessage(): Promise<nearAPI.utils.key_pair.Signature> {
+    throw new Error("Method not implemented.");
+  }
+  async getPublicKey(): Promise<PublicKey> {
+    const derivationPath = this._getDerivationPath();
+    const ledgerPubKey = await this.ledgerState.client.getPublicKey({
+      derivationPath,
+    });
+    return nearAPI.utils.PublicKey.from(ledgerPubKey);
+  }
+
+  async signDelegateAction(
+    delegateAction: DelegateAction
+  ): Promise<[Uint8Array, SignedDelegate]> {
+    const derivationPath = this._getDerivationPath();
+    const signature = await this.ledgerState.client.signDelegateAction({
+      senderId: delegateAction.senderId,
+      receiverId: delegateAction.receiverId,
+      actions: delegateAction.actions,
+      nonce: delegateAction.nonce,
+      maxBlockHeight: delegateAction.maxBlockHeight,
+      derivationPath,
+    });
+    return Promise.resolve([
+      signature,
+      new SignedDelegate({
+        delegateAction,
+        signature: new nearAPI.transactions.Signature({
+          data: signature,
+          keyType: KeyType.ED25519,
+        }),
+      }),
+    ]);
+  }
+
+  async signNep413Message(
+    message: string,
+    accountId: string,
+    recipient: string,
+    nonce: Uint8Array,
+    callbackUrl?: string
+  ): Promise<SignedMessage> {
+    const derivationPath = this._getDerivationPath();
+    const signature = await this.ledgerState.client.signMessage({
+      message,
+      nonce,
+      callbackUrl,
+      recipient,
+      derivationPath,
+    });
+    return Promise.resolve({
+      accountId,
+      publicKey: await this.ledgerState.client.getPublicKey({
+        derivationPath,
+        checkOnDevice: false,
+      }),
+      signature: signature.toString("base64"),
+    });
+  }
+
+  async signTransaction(
+    transaction: NearTransaction
+  ): Promise<[Uint8Array, SignedTransaction]> {
+    const derivationPath = this._getDerivationPath();
+    const signature = await this.ledgerState.client.signTransaction({
+      derivationPath,
+      signerId: transaction.signerId,
+      receiverId: transaction.receiverId,
+      actions: transaction.actions,
+    });
+    return Promise.resolve([
+      signature,
+      new SignedTransaction({
+        transaction,
+        signature: new nearAPI.transactions.Signature({
+          data: signature,
+          keyType: KeyType.ED25519,
+        }),
+      }),
+    ]);
+  }
+}
+
+const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
   options,
   store,
   provider,
@@ -70,44 +194,15 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
   storage,
   metadata,
 }) => {
-  const _state = await setupLedgerState(storage);
+  const _state = await setupLedgerState(storage, logger);
 
-  const signer: Signer = {
-    createKey: () => {
-      throw new Error("Not implemented");
-    },
-    getPublicKey: async (accountId) => {
-      const account = _state.accounts.find((a) => a.accountId === accountId);
-
-      if (!account) {
-        throw new Error("Failed to find public key for account");
-      }
-
-      return nearAPI.utils.PublicKey.from(account.publicKey);
-    },
-    signMessage: async (message, accountId) => {
-      const account = _state.accounts.find((a) => a.accountId === accountId);
-
-      if (!account) {
-        throw new Error("Failed to find account for signing");
-      }
-
-      const signature = await _state.client.sign({
-        data: Buffer.from(message),
-        derivationPath: account.derivationPath,
-      });
-
-      return {
-        signature,
-        publicKey: nearAPI.utils.PublicKey.from(account.publicKey),
-      };
-    },
-  };
+  const signer = new LedgerSigner(_state, store);
 
   const getAccounts = (): Array<Account> => {
     return _state.accounts.map((x) => ({
       accountId: x.accountId,
       publicKey: "ed25519:" + x.publicKey,
+      derivationPath: x.derivationPath,
     }));
   };
 
@@ -131,12 +226,12 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
     cleanup();
   };
 
-  const connectLedgerDevice = async () => {
+  const connectLedgerDevice = async (transport: string) => {
     if (_state.client.isConnected()) {
       return;
     }
 
-    await _state.client.connect();
+    await _state.client.connect(transport);
   };
 
   const validateAccessKey = ({
@@ -166,8 +261,8 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
   };
 
   const transformTransactions = (
-    transactions: Array<Optional<Transaction, "signerId" | "receiverId">>
-  ): Array<Transaction> => {
+    transactions: Array<Optional<WalletTransaction, "signerId" | "receiverId">>
+  ): Array<WalletTransaction> => {
     const { contract } = store.getState();
 
     if (!contract) {
@@ -243,7 +338,7 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
       }
 
       // Note: Connection must be triggered by user interaction.
-      await connectLedgerDevice();
+      await connectLedgerDevice(metadata.transport);
 
       const signedTransactions = await signTransactions(
         transformTransactions([{ signerId, receiverId, actions }]),
@@ -262,7 +357,7 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
       }
 
       // Note: Connection must be triggered by user interaction.
-      await connectLedgerDevice();
+      await connectLedgerDevice(metadata.transport);
 
       const signedTransactions = await signTransactions(
         transformTransactions(transactions),
@@ -280,7 +375,7 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async getPublicKey(derivationPath?: string): Promise<any> {
-      await connectLedgerDevice();
+      await connectLedgerDevice(metadata.transport);
 
       if (typeof derivationPath === "string") {
         return await _state.client.getPublicKey({ derivationPath });
@@ -344,18 +439,14 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
       }
 
       // Note: Connection must be triggered by user interaction.
-      await connectLedgerDevice();
+      await connectLedgerDevice(metadata.transport);
 
-      const serializedPayload = serializeLedgerNEP413Payload({
+      const signature = await _state.client.signMessage({
+        derivationPath: ledgerAccount.derivationPath,
         message,
         nonce,
         recipient,
         callbackUrl,
-      });
-
-      const signature = await _state.client.signMessage({
-        data: serializedPayload,
-        derivationPath: ledgerAccount.derivationPath,
       });
 
       const encodedSignature = Buffer.from(signature).toString("base64");
@@ -388,7 +479,7 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
       }
 
       // Note: Connection must be triggered by user interaction.
-      await connectLedgerDevice();
+      await connectLedgerDevice(metadata.transport);
 
       const [signedTransactions] = await signTransactions(
         transformTransactions([{ receiverId, actions }]),
@@ -418,14 +509,25 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
         nonce,
         callbackUrl,
       });
+      const signedMessage = await signer.signNep413Message(
+        message,
+        accountId,
+        recipient,
+        nonce,
+        callbackUrl
+      );
 
-      throw new Error(`Method not supported by ${metadata.name}`);
+      return {
+        ...signedMessage,
+        signature: Buffer.from(signedMessage.signature),
+        publicKey: PublicKey.fromString(signedMessage.publicKey),
+      };
     },
 
     async signDelegateAction(delegateAction) {
       logger.log("signDelegateAction", { delegateAction });
 
-      throw new Error(`Method not supported by ${metadata.name}`);
+      return signer.signDelegateAction(delegateAction);
     },
   };
 };
@@ -433,10 +535,11 @@ const Ledger: WalletBehaviourFactory<HardwareWallet> = async ({
 export function setupLedger({
   iconUrl = icon,
   deprecated = false,
+  transport = webHidIdentifier,
 }: LedgerParams = {}): WalletModuleFactory<HardwareWallet> {
   return async () => {
     const mobile = isMobile();
-    const supported = isLedgerSupported();
+    const supported = true;
 
     if (mobile) {
       return null;
@@ -452,6 +555,7 @@ export function setupLedger({
         iconUrl,
         deprecated,
         available: supported,
+        transport,
       },
       init: Ledger,
     };
