@@ -1,230 +1,198 @@
-import TransportWebHID from "@ledgerhq/hw-transport-webhid";
-import type Transport from "@ledgerhq/hw-transport";
-import * as nearAPI from "near-api-js";
-
-// Further reading regarding APDU Ledger API:
-// - https://gist.github.com/Wollac/49f0c4e318e42f463b8306298dfb4f4a
-// - https://github.com/LedgerHQ/app-near/blob/master/workdir/app-near/src/constants.h
-
-export const CLA = 0x80; // Always the same for Ledger.
-
-export enum NEAR_INS {
-  GET_VERSION = 0x06,
-  GET_PUBLIC_KEY = 0x04,
-  GET_WALLET_ID = 0x05,
-  SIGN_TRANSACTION = 0x02,
-  NEP413_SIGN_MESSAGE = 0x07,
-  NEP366_SIGN_DELEGATE_ACTION = 0x08,
-}
-
-export const P1_LAST = 0x80; // End of Bytes to Sign (finalize)
-export const P1_MORE = 0x00; // More bytes coming
-export const P1_IGNORE = 0x00;
-export const P2_IGNORE = 0x00;
-export const CHUNK_SIZE = 250;
-
-// Converts BIP32-compliant derivation path to a Buffer.
-// More info here: https://github.com/LedgerHQ/ledger-live-common/blob/master/docs/derivation.md
-export function parseDerivationPath(derivationPath: string) {
-  const parts = derivationPath.split("/");
-
-  return Buffer.concat(
-    parts
-      .map((part) => {
-        return part.endsWith(`'`)
-          ? Math.abs(parseInt(part.slice(0, -1))) | 0x80000000
-          : Math.abs(parseInt(part));
-      })
-      .map((i32) => {
-        return Buffer.from([
-          (i32 >> 24) & 0xff,
-          (i32 >> 16) & 0xff,
-          (i32 >> 8) & 0xff,
-          i32 & 0xff,
-        ]);
-      })
-  );
-}
-
-// TODO: Understand what this is exactly. What's so special about 87?
-export const networkId = "W".charCodeAt(0);
+import {
+  DeviceManagementKitBuilder,
+  type DeviceManagementKit,
+  DeviceActionStatus,
+} from "@ledgerhq/device-management-kit";
+import { webHidTransportFactory } from "@ledgerhq/device-transport-kit-web-hid";
+import { webBleTransportFactory } from "@ledgerhq/device-transport-kit-web-ble";
+import { type SignerNear } from "@hanja-tech/ledger-signer-near";
+import type {
+  HardwareWallet,
+  WalletBehaviourOptions,
+} from "@near-wallet-selector/core";
+import { firstValueFrom, lastValueFrom } from "rxjs";
+import type * as nearAPI from "near-api-js";
 
 interface GetPublicKeyParams {
   derivationPath: string;
+  checkOnDevice?: boolean;
 }
 
 interface SignParams {
-  data: Buffer;
+  signerId: string;
+  receiverId: string;
+  actions: Array<nearAPI.transactions.Action>;
   derivationPath: string;
 }
 
-interface InternalSignParams extends SignParams {
-  ins:
-    | NEAR_INS.NEP366_SIGN_DELEGATE_ACTION
-    | NEAR_INS.NEP413_SIGN_MESSAGE
-    | NEAR_INS.SIGN_TRANSACTION;
+interface SignMessageParams {
+  derivationPath: string;
+  message: string;
+  recipient: string;
+  nonce: Uint8Array;
+  callbackUrl?: string;
 }
 
-interface EventMap {
-  disconnect: Error;
+interface SignDelegateParams {
+  derivationPath: string;
+  maxBlockHeight: bigint;
+  nonce: bigint;
+  actions: Array<nearAPI.transactions.Action>;
+  senderId: string;
+  receiverId: string;
 }
 
 export interface Subscription {
   remove: () => void;
 }
 
-// Not using TransportWebHID.isSupported as it's chosen to use a Promise...
-export const isLedgerSupported = () => {
-  return !!window.navigator?.hid;
-};
-
 export class LedgerClient {
-  private transport: Transport | null = null;
+  private dmk: DeviceManagementKit;
+
+  private sessionId = "";
+  private ledgerSigner: SignerNear | null = null;
+
+  constructor(logger: WalletBehaviourOptions<HardwareWallet>["logger"]) {
+    this.dmk = new DeviceManagementKitBuilder()
+      .addTransport(webHidTransportFactory)
+      .addTransport(webBleTransportFactory)
+      .addLogger(logger)
+      .build();
+  }
 
   isConnected = () => {
-    return Boolean(this.transport);
+    try {
+      this.dmk.getConnectedDevice({ sessionId: this.sessionId });
+      return true;
+    } catch (e) {
+      return false;
+    }
   };
 
-  connect = async () => {
-    this.transport = await TransportWebHID.create();
-
-    const handleDisconnect = () => {
-      this.transport?.off("disconnect", handleDisconnect);
-      this.transport = null;
-    };
-
-    this.transport.on("disconnect", handleDisconnect);
+  connect = async (transport: string) => {
+    this.sessionId = await this.dmk.connect({
+      device: await firstValueFrom(this.dmk.startDiscovering({ transport })),
+    });
   };
 
   disconnect = async () => {
-    if (!this.transport) {
-      throw new Error("Device not connected");
-    }
-
-    await this.transport.close();
-    this.transport = null;
-  };
-
-  setScrambleKey = (key: string) => {
-    if (!this.transport) {
-      throw new Error("Device not connected");
-    }
-
-    this.transport.setScrambleKey(key);
-  };
-
-  on = <Event extends keyof EventMap>(
-    event: Event,
-    callback: (data: EventMap[Event]) => void
-  ): Subscription => {
-    if (!this.transport) {
-      throw new Error("Device not connected");
-    }
-
-    this.transport.on(event, callback);
-
-    return {
-      remove: () => this.transport?.off(event, callback),
-    };
-  };
-
-  off = (event: keyof EventMap, callback: () => void) => {
-    if (!this.transport) {
-      throw new Error("Device not connected");
-    }
-
-    this.transport.off(event, callback);
+    this.dmk.disconnect({ sessionId: this.sessionId });
   };
 
   getVersion = async () => {
-    if (!this.transport) {
+    if (!this.ledgerSigner) {
       throw new Error("Device not connected");
     }
 
-    const res = await this.transport.send(
-      CLA,
-      NEAR_INS.GET_VERSION,
-      P1_IGNORE,
-      P2_IGNORE
+    const getVersionResult = await lastValueFrom(
+      this.ledgerSigner.getVersion({}).observable
     );
 
-    const [major, minor, patch] = Array.from(res);
-
-    return `${major}.${minor}.${patch}`;
-  };
-
-  getPublicKey = async ({ derivationPath }: GetPublicKeyParams) => {
-    if (!this.transport) {
-      throw new Error("Device not connected");
+    if (getVersionResult.status === DeviceActionStatus.Completed) {
+      return getVersionResult.output.version;
+    } else if (getVersionResult.status === DeviceActionStatus.Error) {
+      throw getVersionResult.error;
     }
-
-    const res = await this.transport.send(
-      CLA,
-      NEAR_INS.GET_PUBLIC_KEY,
-      P2_IGNORE,
-      networkId,
-      parseDerivationPath(derivationPath)
-    );
-
-    return nearAPI.utils.serialize.base_encode(
-      new Uint8Array(res.subarray(0, -2))
-    );
+    return "";
   };
 
-  private internalSign = async ({
-    data,
+  getPublicKey = async ({
     derivationPath,
-    ins,
-  }: InternalSignParams) => {
-    if (!this.transport) {
+    checkOnDevice = true,
+  }: GetPublicKeyParams) => {
+    if (!this.ledgerSigner) {
       throw new Error("Device not connected");
     }
+    const pubKeyResult = await firstValueFrom(
+      this.ledgerSigner.getPublicKey(derivationPath, { checkOnDevice })
+        .observable
+    );
 
-    // NOTE: getVersion call resets state to avoid starting from partially filled buffer
-    await this.getVersion();
-
-    const allData = Buffer.concat([parseDerivationPath(derivationPath), data]);
-
-    for (let offset = 0; offset < allData.length; offset += CHUNK_SIZE) {
-      const isLastChunk = offset + CHUNK_SIZE >= allData.length;
-
-      const response = await this.transport.send(
-        CLA,
-        ins,
-        isLastChunk ? P1_LAST : P1_MORE,
-        P2_IGNORE,
-        Buffer.from(allData.subarray(offset, offset + CHUNK_SIZE))
-      );
-
-      if (isLastChunk) {
-        return Buffer.from(response.subarray(0, -2));
-      }
+    if (pubKeyResult.status === DeviceActionStatus.Completed) {
+      return pubKeyResult.output;
+    } else if (pubKeyResult.status === DeviceActionStatus.Error) {
+      throw pubKeyResult.error;
     }
-
-    throw new Error("Invalid data or derivation path");
+    return "";
   };
 
-  sign = async ({ data, derivationPath }: SignParams) => {
-    return this.internalSign({
-      data,
-      derivationPath,
-      ins: NEAR_INS.SIGN_TRANSACTION,
-    });
+  signTransaction = async ({
+    derivationPath,
+    signerId,
+    receiverId,
+    actions,
+  }: SignParams) => {
+    if (!this.ledgerSigner) {
+      throw new Error("Device not connected");
+    }
+    const signTransactionDAResult = await firstValueFrom(
+      this.ledgerSigner.signTransaction(derivationPath, {
+        signerId,
+        receiverId,
+        actions,
+        nonce: BigInt(0),
+        blockHash: Uint8Array.from(new Array(32).fill(0)),
+      }).observable
+    );
+    if (signTransactionDAResult.status === DeviceActionStatus.Completed) {
+      return Buffer.from(signTransactionDAResult.output);
+    } else if (signTransactionDAResult.status === DeviceActionStatus.Error) {
+      throw signTransactionDAResult.error;
+    }
+    return Buffer.from([]);
   };
 
-  signMessage = async ({ data, derivationPath }: SignParams) => {
-    return this.internalSign({
-      data,
-      derivationPath,
-      ins: NEAR_INS.NEP413_SIGN_MESSAGE,
-    });
+  signMessage = async ({
+    message,
+    recipient,
+    nonce,
+    callbackUrl,
+    derivationPath,
+  }: SignMessageParams) => {
+    if (!this.ledgerSigner) {
+      throw new Error("Device not connected");
+    }
+    const signTransactionDAResult = await firstValueFrom(
+      this.ledgerSigner.signMessage(derivationPath, {
+        message,
+        recipient,
+        nonce,
+        callbackUrl,
+      }).observable
+    );
+    if (signTransactionDAResult.status === DeviceActionStatus.Completed) {
+      return Buffer.from(signTransactionDAResult.output);
+    } else if (signTransactionDAResult.status === DeviceActionStatus.Error) {
+      throw signTransactionDAResult.error;
+    }
+    return Buffer.from([]);
   };
 
-  signDelegateAction = async ({ data, derivationPath }: SignParams) => {
-    return this.internalSign({
-      data,
-      derivationPath,
-      ins: NEAR_INS.NEP366_SIGN_DELEGATE_ACTION,
-    });
+  signDelegateAction = async ({
+    senderId,
+    actions,
+    maxBlockHeight,
+    nonce,
+    receiverId,
+    derivationPath,
+  }: SignDelegateParams) => {
+    if (!this.ledgerSigner) {
+      throw new Error("Device not connected");
+    }
+    const signTransactionDAResult = await firstValueFrom(
+      this.ledgerSigner.signDelegate(derivationPath, {
+        senderId,
+        receiverId,
+        actions,
+        nonce,
+        maxBlockHeight,
+      }).observable
+    );
+    if (signTransactionDAResult.status === DeviceActionStatus.Completed) {
+      return Buffer.from(signTransactionDAResult.output);
+    } else if (signTransactionDAResult.status === DeviceActionStatus.Error) {
+      throw signTransactionDAResult.error;
+    }
+    return Buffer.from([]);
   };
 }
