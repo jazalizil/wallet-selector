@@ -17,8 +17,6 @@ import {
   verifyFullKeyBelongsToUser,
   verifySignature,
 } from "@near-wallet-selector/core";
-import { PublicKey } from "@near-js/crypto";
-import { KeyType } from "@near-js/crypto";
 import type {
   DelegateAction,
   Transaction as NearTransaction,
@@ -28,10 +26,16 @@ import { SignedDelegate, SignedTransaction } from "@near-js/transactions";
 import type { Subscription } from "./ledger-client";
 import { LedgerClient } from "./ledger-client";
 import * as nearAPI from "near-api-js";
-import { Signer } from "near-api-js";
-import type { FinalExecutionOutcome } from "near-api-js/lib/providers/index.js";
+import type {
+  FinalExecutionOutcome,
+  JsonRpcProvider,
+} from "near-api-js/lib/providers/index.js";
 import icon from "./icon";
-import { webHidIdentifier } from "@ledgerhq/device-transport-kit-web-hid";
+import { webHidIdentifier } from "@hanja-tech/ledger-device-transport-kit-web-hid";
+import { deserialize, serialize } from "borsh";
+import { near } from "viem/chains";
+import { ProviderService } from "@near-wallet-selector/core/src/lib/services";
+import type { AccessKeyView } from "near-api-js/lib/providers/provider";
 
 interface LedgerAccount extends Account {
   derivationPath: string;
@@ -78,14 +82,14 @@ type LedgerHardwareWallet = HardwareWallet & {
   };
 };
 
-class LedgerSigner extends Signer {
+class LedgerSigner extends nearAPI.Signer {
   constructor(
     private ledgerState: LedgerState,
     private store: WalletBehaviourOptions<HardwareWallet>["store"]
   ) {
     super();
   }
-  createKey(): Promise<PublicKey> {
+  createKey(): Promise<nearAPI.utils.PublicKey> {
     throw new Error("Method not implemented.");
   }
   private _getDerivationPath() {
@@ -103,13 +107,29 @@ class LedgerSigner extends Signer {
     }
     return ledgerAccount.derivationPath;
   }
-  signMessage(): Promise<nearAPI.utils.key_pair.Signature> {
-    throw new Error("Method not implemented.");
+  async signMessage(transaction: Uint8Array) {
+    const derivationPath = this._getDerivationPath();
+    console.log("START sign message", transaction);
+    const { publicKey, ...tx } = deserialize(
+      nearAPI.transactions.SCHEMA.Transaction,
+      transaction
+    ) as NearTransaction;
+    const signature = await this.ledgerState.client.signTransaction({
+      ...tx,
+      derivationPath,
+    });
+    console.log("sign message result::", publicKey.toString());
+    return {
+      accountId: this.ledgerState.accounts[0].accountId,
+      publicKey: publicKey,
+      signature: signature,
+    };
   }
-  async getPublicKey(): Promise<PublicKey> {
+  async getPublicKey(signerId?: string): Promise<nearAPI.utils.PublicKey> {
     const derivationPath = this._getDerivationPath();
     const ledgerPubKey = await this.ledgerState.client.getPublicKey({
       derivationPath,
+      checkOnDevice: !signerId,
     });
     return nearAPI.utils.PublicKey.from(ledgerPubKey);
   }
@@ -132,7 +152,7 @@ class LedgerSigner extends Signer {
         delegateAction,
         signature: new nearAPI.transactions.Signature({
           data: signature,
-          keyType: KeyType.ED25519,
+          keyType: nearAPI.utils.key_pair.KeyType.ED25519,
         }),
       }),
     ]);
@@ -144,7 +164,7 @@ class LedgerSigner extends Signer {
     recipient: string,
     nonce: Uint8Array,
     callbackUrl?: string
-  ): Promise<SignedMessage> {
+  ): ReturnType<nearAPI.Signer["signNep413Message"]> {
     const derivationPath = this._getDerivationPath();
     const signature = await this.ledgerState.client.signMessage({
       message,
@@ -153,20 +173,22 @@ class LedgerSigner extends Signer {
       recipient,
       derivationPath,
     });
-    return Promise.resolve({
-      accountId,
-      publicKey: await this.ledgerState.client.getPublicKey({
-        derivationPath,
-        checkOnDevice: false,
-      }),
-      signature: signature.toString("base64"),
+    const publicKey = await this.ledgerState.client.getPublicKey({
+      derivationPath,
+      checkOnDevice: false,
     });
+    return {
+      accountId,
+      publicKey: nearAPI.utils.PublicKey.from(publicKey),
+      signature,
+    };
   }
 
   async signTransaction(
     transaction: NearTransaction
   ): Promise<[Uint8Array, SignedTransaction]> {
     const derivationPath = this._getDerivationPath();
+    console.log("start signing transaction", transaction);
     const signature = await this.ledgerState.client.signTransaction({
       derivationPath,
       signerId: transaction.signerId,
@@ -179,7 +201,7 @@ class LedgerSigner extends Signer {
         transaction,
         signature: new nearAPI.transactions.Signature({
           data: signature,
-          keyType: KeyType.ED25519,
+          keyType: nearAPI.utils.key_pair.KeyType.ED25519,
         }),
       }),
     ]);
@@ -189,12 +211,14 @@ class LedgerSigner extends Signer {
 const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
   options,
   store,
-  provider,
   logger,
   storage,
   metadata,
 }) => {
   const _state = await setupLedgerState(storage, logger);
+  const provider: JsonRpcProvider = new nearAPI.providers.JsonRpcProvider({
+    url: options.network.nodeUrl,
+  });
 
   const signer = new LedgerSigner(_state, store);
 
@@ -234,30 +258,37 @@ const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
     await _state.client.connect(transport);
   };
 
-  const validateAccessKey = ({
+  const validateAccessKey = async ({
     accountId,
     publicKey,
   }: ValidateAccessKeyParams) => {
     logger.log("validateAccessKey", { accountId, publicKey });
+    try {
+      const accessKey: AccessKeyView = await provider.query<AccessKeyView>({
+        request_type: "view_access_key",
+        finality: "final",
+        account_id: accountId,
+        public_key: publicKey,
+      });
+      logger.log("validateAccessKey:accessKey", { accessKey });
 
-    return provider.viewAccessKey({ accountId, publicKey }).then(
-      (accessKey) => {
-        logger.log("validateAccessKey:accessKey", { accessKey });
-
-        if (accessKey.permission !== "FullAccess") {
-          throw new Error("Public key requires 'FullAccess' permission");
-        }
-
-        return accessKey;
-      },
-      (err) => {
-        if (err.type === "AccessKeyDoesNotExist") {
-          return null;
-        }
-
-        throw err;
+      if (accessKey.permission !== "FullAccess") {
+        throw new Error("Public key requires 'FullAccess' permission");
       }
-    );
+
+      return accessKey;
+    } catch (err) {
+      if (
+        typeof err === "object" &&
+        err != null &&
+        "type" in err &&
+        err.type === "AccessKeyDoesNotExist"
+      ) {
+        return null;
+      }
+
+      throw err;
+    }
   };
 
   const transformTransactions = (
@@ -345,8 +376,18 @@ const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
         signer,
         options.network
       );
-
-      return provider.sendTransaction(signedTransactions[0]);
+      console.log("sign and send tx 111", provider, signedTransactions[0]);
+      const encodedTx = serialize(
+        nearAPI.transactions.SCHEMA.SignedTransaction,
+        signedTransactions[0]
+      );
+      console.log("sign and send tx", provider, signedTransactions[0]);
+      const result = await provider.sendJsonRpc("send_tx", {
+        signed_tx_base64: Buffer.from(encodedTx).toString("base64"),
+        wait_until: "INCLUDED_FINAL",
+      });
+      console.log("JSONRPC result", result);
+      return provider.sendTransactionAsync(signedTransactions[0]);
     },
 
     async signAndSendTransactions({ transactions }) {
@@ -378,7 +419,9 @@ const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
       await connectLedgerDevice(metadata.transport);
 
       if (typeof derivationPath === "string") {
-        return await _state.client.getPublicKey({ derivationPath });
+        const pkey = await _state.client.getPublicKey({ derivationPath });
+        console.log("GET PUBLIC KEY FROM CLIENT 111::", pkey);
+        return pkey;
       } else {
         const account = getActiveAccount(store.getState());
 
@@ -397,6 +440,7 @@ const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
         const pk = await _state.client.getPublicKey({
           derivationPath: activeAccount.derivationPath,
         });
+        console.log("GET PUBLIC KEY FROM CLIENT::", pk);
 
         return nearAPI.utils.PublicKey.fromString(pk);
       }
@@ -448,8 +492,10 @@ const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
         recipient,
         callbackUrl,
       });
+      console.log("signature to resolve", signature);
 
       const encodedSignature = Buffer.from(signature).toString("base64");
+      console.log("signature to resolve", encodedSignature);
 
       const isSignatureValid = verifySignature({
         publicKey: ledgerAccount.publicKey,
@@ -492,13 +538,7 @@ const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
 
     async signTransaction(transaction) {
       logger.log("signTransaction", { transaction });
-
-      return await nearAPI.transactions.signTransaction(
-        transaction,
-        signer,
-        transaction.signerId,
-        options.network.networkId
-      );
+      return await signer.signTransaction(transaction);
     },
 
     async signNep413Message(message, accountId, recipient, nonce, callbackUrl) {
@@ -520,7 +560,7 @@ const Ledger: WalletBehaviourFactory<LedgerHardwareWallet> = async ({
       return {
         ...signedMessage,
         signature: Buffer.from(signedMessage.signature),
-        publicKey: PublicKey.fromString(signedMessage.publicKey),
+        publicKey: nearAPI.utils.PublicKey.fromString(signedMessage.publicKey),
       };
     },
 

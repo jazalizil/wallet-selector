@@ -1,17 +1,24 @@
+import type { DeviceManagementKit } from "@ledgerhq/device-management-kit";
 import {
-  DeviceManagementKitBuilder,
-  type DeviceManagementKit,
   DeviceActionStatus,
+  DeviceManagementKitBuilder,
 } from "@ledgerhq/device-management-kit";
-import { webHidTransportFactory } from "@ledgerhq/device-transport-kit-web-hid";
-import { webBleTransportFactory } from "@ledgerhq/device-transport-kit-web-ble";
-import { type SignerNear } from "@hanja-tech/ledger-signer-near";
+
 import type {
   HardwareWallet,
   WalletBehaviourOptions,
 } from "@near-wallet-selector/core";
 import { firstValueFrom, lastValueFrom } from "rxjs";
 import type * as nearAPI from "near-api-js";
+
+import { webHidTransportFactory } from "@hanja-tech/ledger-device-transport-kit-web-hid";
+
+import { webBleTransportFactory } from "@hanja-tech/ledger-device-transport-kit-web-ble";
+
+import {
+  type SignerNear,
+  SignerNearBuilder,
+} from "@hanja-tech/ledger-signer-near";
 
 interface GetPublicKeyParams {
   derivationPath: string;
@@ -73,6 +80,10 @@ export class LedgerClient {
     this.sessionId = await this.dmk.connect({
       device: await firstValueFrom(this.dmk.startDiscovering({ transport })),
     });
+    this.ledgerSigner = new SignerNearBuilder({
+      dmk: this.dmk,
+      sessionId: this.sessionId,
+    }).build();
   };
 
   disconnect = async () => {
@@ -103,12 +114,13 @@ export class LedgerClient {
     if (!this.ledgerSigner) {
       throw new Error("Device not connected");
     }
-    const pubKeyResult = await firstValueFrom(
+    const pubKeyResult = await lastValueFrom(
       this.ledgerSigner.getPublicKey(derivationPath, { checkOnDevice })
         .observable
     );
 
     if (pubKeyResult.status === DeviceActionStatus.Completed) {
+      console.log("get poub key in client::", pubKeyResult.output);
       return pubKeyResult.output;
     } else if (pubKeyResult.status === DeviceActionStatus.Error) {
       throw pubKeyResult.error;
@@ -125,7 +137,7 @@ export class LedgerClient {
     if (!this.ledgerSigner) {
       throw new Error("Device not connected");
     }
-    const signTransactionDAResult = await firstValueFrom(
+    const signTransactionDAResult = await lastValueFrom(
       this.ledgerSigner.signTransaction(derivationPath, {
         signerId,
         receiverId,
@@ -152,7 +164,7 @@ export class LedgerClient {
     if (!this.ledgerSigner) {
       throw new Error("Device not connected");
     }
-    const signTransactionDAResult = await firstValueFrom(
+    const signTransactionDAResult = await lastValueFrom(
       this.ledgerSigner.signMessage(derivationPath, {
         message,
         recipient,
@@ -161,11 +173,11 @@ export class LedgerClient {
       }).observable
     );
     if (signTransactionDAResult.status === DeviceActionStatus.Completed) {
-      return Buffer.from(signTransactionDAResult.output);
+      return signTransactionDAResult.output;
     } else if (signTransactionDAResult.status === DeviceActionStatus.Error) {
       throw signTransactionDAResult.error;
     }
-    return Buffer.from([]);
+    return Uint8Array.from([]);
   };
 
   signDelegateAction = async ({
@@ -179,7 +191,7 @@ export class LedgerClient {
     if (!this.ledgerSigner) {
       throw new Error("Device not connected");
     }
-    const signTransactionDAResult = await firstValueFrom(
+    const signTransactionDAResult = await lastValueFrom(
       this.ledgerSigner.signDelegate(derivationPath, {
         senderId,
         receiverId,
